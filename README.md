@@ -138,7 +138,7 @@ Automatically finds and runs `ebook-convert` with `--enable-heuristics` flag. Se
 
 ## Workflow Example
 
-1. Use [WebToEpub](https://github.com/nickvergessen/WebToEpub) browser extension to download a Chinese web novel
+1. Use [WebToEpub](https://github.com/dteviot/WebToEpub) browser extension to download a Chinese web novel
 2. Run: `python epub_fixer.py downloaded_novel.epub`
 3. Upload `downloaded_novel_translated.epub` to Google Play Books
 4. Read!
