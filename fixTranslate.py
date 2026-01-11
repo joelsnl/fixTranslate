@@ -12,7 +12,7 @@ Fixes common structural issues from WebToEpub:
 Then translates Chinese to English using Google Translate (Free).
 Finally runs Calibre heuristic processing for Google Play Books compatibility.
 
-Translation implementation matches the Calibre Ebook Translator plugin exactly.
+Uses concurrent translation like the Calibre Ebook Translator plugin for speed.
 
 Usage: 
     python epub_fixer.py input.epub                  # Full pipeline (fix + translate + calibre)
@@ -31,6 +31,8 @@ import json
 import subprocess
 import shutil
 import requests
+import concurrent.futures
+import threading
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 
@@ -70,18 +72,16 @@ INVISIBLE_CHARS = [
 
 
 # ============================================================================
-# GOOGLE TRANSLATE (FREE) - Using requests library like plugin uses mechanize
+# GOOGLE TRANSLATE (FREE) - Concurrent implementation like Calibre plugin
 # ============================================================================
 class GoogleFreeTranslate:
     """
-    Google Translate Free API - matches Calibre Ebook Translator plugin.
-    Uses requests library (similar to how plugin uses mechanize).
+    Google Translate Free API with concurrent requests.
+    Matches Calibre Ebook Translator plugin performance.
     """
     
-    # Same endpoint as Calibre plugin
     ENDPOINT = 'https://translate.googleapis.com/translate_a/single'
     
-    # Same User-Agent as Calibre plugin
     USER_AGENT = (
         'DeepLBrowserExtension/1.3.0 Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
         'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36'
@@ -91,6 +91,7 @@ class GoogleFreeTranslate:
         self, 
         source_lang: str = 'zh-CN',
         target_lang: str = 'en',
+        max_workers: int = 0,  # 0 = auto (based on paragraph count, like plugin)
         request_timeout: int = 10,
         request_attempt: int = 3,
         request_interval: float = 0.0,
@@ -98,6 +99,7 @@ class GoogleFreeTranslate:
     ):
         self.source_lang = source_lang
         self.target_lang = target_lang
+        self.max_workers = max_workers
         self.request_timeout = request_timeout
         self.request_attempt = request_attempt
         self.request_interval = request_interval
@@ -107,20 +109,23 @@ class GoogleFreeTranslate:
             'requests': 0,
             'paragraphs_translated': 0,
             'characters_translated': 0,
+            'cache_hits': 0,
             'errors': 0,
         }
         
-        # Cache translations
+        # Thread-safe cache
         self.cache: Dict[str, str] = {}
+        self.cache_lock = threading.Lock()
         
-        # Session for connection pooling (like mechanize Browser)
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': self.USER_AGENT,
-        })
+        # Thread-safe stats
+        self.stats_lock = threading.Lock()
+        
+        # Progress tracking
+        self.completed = 0
+        self.total = 0
+        self.progress_lock = threading.Lock()
     
     def _get_params(self, text: str) -> dict:
-        """Same params as Calibre plugin GoogleFreeTranslate.get_body()"""
         return {
             'client': 'gtx',
             'sl': self.source_lang,
@@ -131,75 +136,131 @@ class GoogleFreeTranslate:
         }
     
     def _get_result(self, data: dict) -> str:
-        """Same parsing as Calibre plugin GoogleFreeTranslate.get_result()"""
         if 'sentences' in data:
             return ''.join(s.get('trans', '') for s in data['sentences'] if 'trans' in s)
         return ''
     
-    def _make_request(self, text: str) -> str:
-        """Make translation request - matches plugin behavior."""
-        params = self._get_params(text)
+    def _translate_single(self, text: str, index: int) -> Tuple[int, str]:
+        """Translate a single text. Returns (index, translated_text)."""
+        if not text or not text.strip():
+            return (index, text)
         
+        cache_key = text.strip()
+        
+        # Check cache (thread-safe)
+        with self.cache_lock:
+            if cache_key in self.cache:
+                with self.stats_lock:
+                    self.stats['cache_hits'] += 1
+                self._update_progress()
+                return (index, self.cache[cache_key])
+        
+        # Make request with retries
+        params = self._get_params(text)
         last_error = None
         interval = 0
         
         for attempt in range(self.request_attempt):
             try:
-                # Same logic as plugin: GET for <= 1800 chars, POST for longer
+                # GET for short, POST for long (like plugin)
                 if len(text) <= 1800:
-                    response = self.session.get(
+                    response = requests.get(
                         self.ENDPOINT,
                         params=params,
+                        headers={'User-Agent': self.USER_AGENT},
                         timeout=self.request_timeout
                     )
                 else:
-                    response = self.session.post(
+                    response = requests.post(
                         self.ENDPOINT,
                         data=params,
+                        headers={'User-Agent': self.USER_AGENT},
                         timeout=self.request_timeout
                     )
                 
                 response.raise_for_status()
-                return self._get_result(response.json())
+                translated = self._get_result(response.json())
+                
+                # Cache result (thread-safe)
+                with self.cache_lock:
+                    self.cache[cache_key] = translated
+                
+                # Update stats (thread-safe)
+                with self.stats_lock:
+                    self.stats['requests'] += 1
+                    self.stats['paragraphs_translated'] += 1
+                    self.stats['characters_translated'] += len(text)
+                
+                self._update_progress()
+                
+                # Optional delay between requests
+                if self.request_interval > 0:
+                    time.sleep(self.request_interval)
+                
+                return (index, translated)
                     
             except Exception as e:
                 last_error = e
                 if attempt < self.request_attempt - 1:
                     interval += 5
-                    if self.verbose:
-                        print(f"    Retry {attempt + 1}/{self.request_attempt}, "
-                              f"waiting {interval}s: {str(e)[:60]}")
                     time.sleep(interval)
         
-        self.stats['errors'] += 1
+        # All retries failed
+        with self.stats_lock:
+            self.stats['errors'] += 1
+        self._update_progress()
+        return (index, text)  # Return original on failure
+    
+    def _update_progress(self):
+        """Update and print progress."""
+        with self.progress_lock:
+            self.completed += 1
+            if self.verbose and self.total > 0:
+                pct = (self.completed / self.total) * 100
+                print(f"\r  Translating: {self.completed}/{self.total} ({pct:.1f}%)", end='', flush=True)
+    
+    def translate_concurrent(self, texts: List[str]) -> List[str]:
+        """
+        Translate all texts concurrently using ThreadPoolExecutor.
+        This is the key to matching Calibre plugin speed.
+        """
+        if not texts:
+            return []
+        
+        self.total = len(texts)
+        self.completed = 0
+        
+        # Determine worker count (like plugin: 0 means use all)
+        workers = self.max_workers if self.max_workers > 0 else min(len(texts), 100)
+        
         if self.verbose:
-            print(f"    Translation failed after {self.request_attempt} attempts: {last_error}")
-        return text
-    
-    def translate(self, text: str) -> str:
-        """Translate a single piece of text."""
-        if not text or not text.strip():
-            return text
+            print(f"  Starting translation with {workers} concurrent workers...")
         
-        cache_key = text.strip()
-        if cache_key in self.cache:
-            return self.cache[cache_key]
+        # Results array (same order as input)
+        results = [''] * len(texts)
         
-        translated = self._make_request(text)
-        self.stats['requests'] += 1
-        self.stats['paragraphs_translated'] += 1
-        self.stats['characters_translated'] += len(text)
+        # Submit all tasks to thread pool
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            # Create futures with their indices
+            futures = {
+                executor.submit(self._translate_single, text, i): i 
+                for i, text in enumerate(texts)
+            }
+            
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    index, translated = future.result()
+                    results[index] = translated
+                except Exception as e:
+                    # On exception, keep original text
+                    index = futures[future]
+                    results[index] = texts[index]
         
-        self.cache[cache_key] = translated
+        if self.verbose:
+            print()  # Newline after progress
         
-        if self.request_interval > 0:
-            time.sleep(self.request_interval)
-        
-        return translated
-    
-    def translate_batch(self, texts: List[str]) -> List[str]:
-        """Translate a batch of texts."""
-        return [self.translate(text) for text in texts]
+        return results
 
 
 # ============================================================================
@@ -216,6 +277,7 @@ class EPUBFixer:
         remove_watermarks: bool = True,
         remove_invisible_chars: bool = True,
         translate: bool = False,
+        max_workers: int = 0,
         request_interval: float = 0.0,
         custom_watermarks: List[str] = None,
         verbose: bool = True
@@ -232,6 +294,7 @@ class EPUBFixer:
         self.translator = None
         if translate:
             self.translator = GoogleFreeTranslate(
+                max_workers=max_workers,
                 request_interval=request_interval,
                 verbose=verbose
             )
@@ -290,7 +353,7 @@ class EPUBFixer:
         return text
     
     def process_body_content(self, body_content: str) -> str:
-        """Process body content: clean, fix structure, optionally translate."""
+        """Process body content: clean and fix structure."""
         
         # Step 1: Convert <br> tags to newlines
         if self.convert_br_to_p:
@@ -373,71 +436,14 @@ class EPUBFixer:
                         else:
                             wrapped_lines.append('')
                     
-                    result_tokens.append('\n'.join(wrapped_lines))
-                else:
-                    result_tokens.append(text)
+                    text = '\n'.join(wrapped_lines)
+                
+                result_tokens.append(text)
         
         new_body = ''.join(result_tokens)
         new_body = re.sub(r'\n{3,}', '\n\n', new_body)
         
-        # Step 4: Translate if enabled
-        if self.translate and self.translator:
-            new_body = self.translate_body_content(new_body)
-        
         return new_body
-    
-    def translate_body_content(self, body_content: str) -> str:
-        """Translate text content within HTML tags."""
-        # Split into tags and text
-        token_pattern = r'(<[^>]+>)'
-        tokens = re.split(token_pattern, body_content)
-        
-        result_tokens = []
-        
-        for i, token in enumerate(tokens):
-            if token and not token.startswith('<'):
-                stripped = token.strip()
-                if stripped and self.is_chinese(stripped):
-                    # Translate this text
-                    translated = self.translator.translate(stripped)
-                    
-                    # Preserve leading/trailing whitespace
-                    leading_ws = len(token) - len(token.lstrip())
-                    trailing_ws = len(token) - len(token.rstrip())
-                    
-                    if trailing_ws > 0:
-                        result_tokens.append(
-                            token[:leading_ws] + translated + token[-trailing_ws:]
-                        )
-                    else:
-                        result_tokens.append(token[:leading_ws] + translated)
-                else:
-                    result_tokens.append(token)
-            else:
-                result_tokens.append(token)
-        
-        return ''.join(result_tokens)
-    
-    def fix_xhtml_content(self, content: str) -> str:
-        """Apply fixes to XHTML content. Only modifies <body> content."""
-        body_match = re.search(
-            r'(<body[^>]*>)(.*?)(</body>)', 
-            content, 
-            re.DOTALL | re.IGNORECASE
-        )
-        
-        if not body_match:
-            return content
-        
-        before_body = content[:body_match.start()]
-        body_open_tag = body_match.group(1)
-        body_content = body_match.group(2)
-        body_close_tag = body_match.group(3)
-        after_body = content[body_match.end():]
-        
-        fixed_body_content = self.process_body_content(body_content)
-        
-        return before_body + body_open_tag + fixed_body_content + body_close_tag + after_body
     
     def process_epub(self, input_path: str, output_path: str) -> dict:
         """Process an EPUB file and return statistics."""
@@ -473,7 +479,12 @@ class EPUBFixer:
             total_files = len(files_to_process)
             self.log(f"Processing {total_files} content files...")
             
-            for idx, (filepath, filename) in enumerate(files_to_process, 1):
+            # PHASE 1: Fix structure and collect all Chinese text
+            all_chinese_texts = []  # (file_idx, token_idx, text, leading_ws, trailing_ws, full_token)
+            file_tokens = []  # Store tokenized content for each file
+            file_data = []  # Store (filepath, before_body, body_open, body_close, after_body)
+            
+            for idx, (filepath, filename) in enumerate(files_to_process):
                 try:
                     content = None
                     for encoding in ['utf-8', 'gbk', 'gb2312', 'big5', 'latin-1']:
@@ -485,22 +496,100 @@ class EPUBFixer:
                             continue
                     
                     if content is None:
-                        self.log(f"  [{idx}/{total_files}] ✗ {filename} (decode error)")
+                        self.log(f"  [{idx+1}/{total_files}] ✗ {filename} (decode error)")
+                        file_tokens.append(None)
+                        file_data.append(None)
                         continue
                     
                     if '<body' not in content.lower():
+                        file_tokens.append(None)
+                        file_data.append(None)
                         continue
                     
-                    fixed_content = self.fix_xhtml_content(content)
+                    # Extract body
+                    body_match = re.search(
+                        r'(<body[^>]*>)(.*?)(</body>)', 
+                        content, 
+                        re.DOTALL | re.IGNORECASE
+                    )
                     
-                    with open(filepath, 'w', encoding='utf-8') as f:
-                        f.write(fixed_content)
+                    if not body_match:
+                        file_tokens.append(None)
+                        file_data.append(None)
+                        continue
+                    
+                    before_body = content[:body_match.start()]
+                    body_open_tag = body_match.group(1)
+                    body_content = body_match.group(2)
+                    body_close_tag = body_match.group(3)
+                    after_body = content[body_match.end():]
+                    
+                    # Process body content (fix structure)
+                    fixed_body = self.process_body_content(body_content)
+                    
+                    # Tokenize for later replacement
+                    token_pattern = r'(<[^>]+>)'
+                    tokens = re.split(token_pattern, fixed_body)
+                    file_tokens.append(tokens)
+                    file_data.append((filepath, before_body, body_open_tag, body_close_tag, after_body))
+                    
+                    # Scan tokens for Chinese text
+                    for token_idx, token in enumerate(tokens):
+                        if token and not token.startswith('<'):
+                            stripped = token.strip()
+                            if stripped and self.is_chinese(stripped):
+                                leading_ws = len(token) - len(token.lstrip())
+                                trailing_ws = len(token) - len(token.rstrip())
+                                all_chinese_texts.append((idx, token_idx, stripped, leading_ws, trailing_ws, token))
                     
                     self.stats['files_processed'] += 1
-                    self.log(f"  [{idx}/{total_files}] ✓ {filename}")
-                
+                    
                 except Exception as e:
-                    self.log(f"  [{idx}/{total_files}] ✗ {filename}: {e}")
+                    self.log(f"  [{idx+1}/{total_files}] ✗ {filename}: {e}")
+                    file_tokens.append(None)
+                    file_data.append(None)
+            
+            self.log(f"  Found {len(all_chinese_texts)} text segments to translate")
+            
+            # PHASE 2: Translate all Chinese text concurrently
+            if self.translate and self.translator and all_chinese_texts:
+                self.log(f"\nTranslating...")
+                
+                # Extract just the text
+                texts_to_translate = [t[2] for t in all_chinese_texts]
+                
+                # Translate concurrently
+                translated_texts = self.translator.translate_concurrent(texts_to_translate)
+                
+                # Map translations back to tokens
+                for i, (file_idx, token_idx, original, leading_ws, trailing_ws, full_token) in enumerate(all_chinese_texts):
+                    translated = translated_texts[i]
+                    tokens = file_tokens[file_idx]
+                    if tokens is not None:
+                        # Reconstruct with original whitespace
+                        if trailing_ws > 0:
+                            tokens[token_idx] = full_token[:leading_ws] + translated + full_token[-trailing_ws:]
+                        else:
+                            tokens[token_idx] = full_token[:leading_ws] + translated
+            
+            # PHASE 3: Write all files
+            self.log(f"\nWriting files...")
+            for idx, (filepath, filename) in enumerate(files_to_process):
+                if file_tokens[idx] is None or file_data[idx] is None:
+                    continue
+                
+                tokens = file_tokens[idx]
+                filepath, before_body, body_open_tag, body_close_tag, after_body = file_data[idx]
+                
+                # Reconstruct content
+                body_content = ''.join(tokens)
+                body_content = re.sub(r'\n{3,}', '\n\n', body_content)
+                full_content = before_body + body_open_tag + body_content + body_close_tag + after_body
+                
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(full_content)
+                
+                self.log(f"  [{idx+1}/{total_files}] ✓ {filename}")
             
             # Repackage
             self.log(f"\nRepackaging EPUB...")
@@ -535,8 +624,8 @@ Examples:
   %(prog)s novel.epub --no-calibre        # Fix and translate only
   %(prog)s novel.epub --no-translate      # Fix and Calibre process only
   %(prog)s novel.epub -o out.epub         # Custom output name
-  %(prog)s novel.epub --interval 0.5      # Add delay between requests
-  %(prog)s novel.epub --no-watermarks     # Keep watermarks
+  %(prog)s novel.epub --workers 50        # Limit concurrent requests
+  %(prog)s novel.epub --interval 0.1      # Add delay between requests
         """
     )
     
@@ -546,6 +635,8 @@ Examples:
     # Translation (on by default)
     parser.add_argument('--no-translate', action='store_true',
                         help='Skip translation (fix structure only)')
+    parser.add_argument('--workers', type=int, default=0,
+                        help='Max concurrent translation requests (0=auto, default: 0)')
     parser.add_argument('--interval', type=float, default=0.0,
                         help='Delay between translation requests in seconds (default: 0)')
     
@@ -596,6 +687,7 @@ Examples:
         remove_watermarks=not args.no_watermarks,
         remove_invisible_chars=not args.no_invisible,
         translate=do_translate,
+        max_workers=args.workers,
         request_interval=args.interval,
         custom_watermarks=args.add_watermark,
         verbose=not args.quiet,
@@ -635,6 +727,7 @@ Examples:
             print(f"  API requests:          {stats.get('requests', 0)}")
             print(f"  Paragraphs translated: {stats.get('paragraphs_translated', 0)}")
             print(f"  Characters translated: {stats.get('characters_translated', 0)}")
+            print(f"  Cache hits:            {stats.get('cache_hits', 0)}")
             print(f"  Errors:                {stats.get('errors', 0)}")
         
         print(f"\nCompleted in {elapsed:.1f} seconds")
