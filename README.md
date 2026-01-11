@@ -4,7 +4,7 @@ A Python tool to fix, translate, and process Chinese EPUBs for reading on Google
 
 **One command does it all:**
 ```bash
-python epub_fixer.py novel.epub
+python fixTranslate.py novel.epub
 ```
 
 ## What It Does
@@ -41,14 +41,14 @@ python epub_fixer.py novel.epub
    pip install requests
    ```
 
-3. Download `epub_fixer.py` and you're ready to go.
+3. Download `fixTranslate.py` and you're ready to go.
 
 ## Usage
 
 ### Basic Usage (Recommended)
 
 ```bash
-python epub_fixer.py novel.epub
+python fixTranslate.py novel.epub
 ```
 
 This runs the full pipeline: fix → translate → Calibre process. Output is saved as `novel_translated.epub`.
@@ -56,33 +56,33 @@ This runs the full pipeline: fix → translate → Calibre process. Output is sa
 ### Custom Output Name
 
 ```bash
-python epub_fixer.py novel.epub -o "My Novel English.epub"
+python fixTranslate.py novel.epub -o "My Novel English.epub"
 ```
 
 ### Skip Steps
 
 ```bash
 # Fix and translate only (skip Calibre processing)
-python epub_fixer.py novel.epub --no-calibre
+python fixTranslate.py novel.epub --no-calibre
 
 # Fix and Calibre process only (skip translation)
-python epub_fixer.py novel.epub --no-translate
+python fixTranslate.py novel.epub --no-translate
 ```
 
 ### Control Concurrency
 
 ```bash
 # Limit to 50 concurrent translation requests
-python epub_fixer.py novel.epub --workers 50
+python fixTranslate.py novel.epub --workers 50
 
 # Add delay between requests (if getting rate limited)
-python epub_fixer.py novel.epub --interval 0.1
+python fixTranslate.py novel.epub --interval 0.1
 ```
 
 ### Quiet Mode
 
 ```bash
-python epub_fixer.py novel.epub -q
+python fixTranslate.py novel.epub -q
 ```
 
 ## All Options
@@ -114,7 +114,7 @@ The script automatically removes common Chinese novel site watermarks including:
 
 To add custom patterns:
 ```bash
-python epub_fixer.py novel.epub --add-watermark "我的自定义水印.*"
+python fixTranslate.py novel.epub --add-watermark "我的自定义水印.*"
 ```
 
 ## How It Works
@@ -145,7 +145,7 @@ Automatically finds and runs `ebook-convert` with `--enable-heuristics` flag. Se
 ## Workflow Example
 
 1. Use [WebToEpub](https://github.com/dteviot/WebToEpub) browser extension to download a Chinese web novel
-2. Run: `python epub_fixer.py downloaded_novel.epub`
+2. Run: `python fixTranslate.py downloaded_novel.epub`
 3. Upload `downloaded_novel_translated.epub` to Google Play Books
 4. Read!
 
