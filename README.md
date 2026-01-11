@@ -1,6 +1,8 @@
 # EPUB Fixer & Translator
 
-A Python tool to fix, translate, and process Chinese EPUBs for reading on Google Play Books (or any e-reader).
+A standalone Python tool to fix, validate, and translate Chinese EPUBs for reading on Google Play Books (or any e-reader).
+
+**No Calibre required!** All EPUB validation/repair is built-in.
 
 **One command does it all:**
 ```bash
@@ -16,32 +18,34 @@ python fixTranslate.py novel.epub
    - Strips watermarks and ads from Chinese novel sites
    - Removes invisible/zero-width characters
 
-2. **Translates Chinese → English** using Google Translate (Free):
+2. **EPUB validation/repair** (replaces Calibre heuristics):
+   - Removes invalid elements (scripts, forms, embed, object)
+   - Converts deprecated tags (`<center>`, `<u>`, `<font>`, `<s>`, `<strike>`)
+   - Fixes duplicate IDs (causes validation errors)
+   - Cleans special characters for e-reader compatibility
+   - Ensures proper EPUB structure (mimetype first, uncompressed)
+
+3. **Translates Chinese → English** using Google Translate (Free):
    - **Concurrent translation** - up to 100 parallel requests (same speed as Calibre plugin!)
    - Same API implementation as the [Calibre Ebook Translator plugin](https://github.com/bookfere/Ebook-Translator-Calibre-Plugin)
    - Automatic retry with backoff on failures
    - In-memory caching to avoid duplicate requests
 
-3. **Runs Calibre heuristic processing** for compatibility:
-   - Fixes EPUB validation issues
-   - Ensures compatibility with Google Play Books and other strict readers
-
 ## Requirements
 
 - Python 3.7+
-- [Calibre](https://calibre-ebook.com/) (for the final processing step)
 - `requests` library
+
+That's it! No Calibre needed.
 
 ## Installation
 
-1. Install Calibre from https://calibre-ebook.com/
-
-2. Install the required Python package:
+1. Install the required Python package:
    ```bash
    pip install requests
    ```
 
-3. Download `fixTranslate.py` and you're ready to go.
+2. Download `fixTranslate.py` and you're ready to go.
 
 ## Usage
 
@@ -51,7 +55,7 @@ python fixTranslate.py novel.epub
 python fixTranslate.py novel.epub
 ```
 
-This runs the full pipeline: fix → translate → Calibre process. Output is saved as `novel_translated.epub`.
+This runs the full pipeline: fix → validate → translate. Output is saved as `novel_translated.epub`.
 
 ### Custom Output Name
 
@@ -59,13 +63,9 @@ This runs the full pipeline: fix → translate → Calibre process. Output is sa
 python fixTranslate.py novel.epub -o "My Novel English.epub"
 ```
 
-### Skip Steps
+### Skip Translation (Fix Only)
 
 ```bash
-# Fix and translate only (skip Calibre processing)
-python fixTranslate.py novel.epub --no-calibre
-
-# Fix and Calibre process only (skip translation)
 python fixTranslate.py novel.epub --no-translate
 ```
 
@@ -91,9 +91,9 @@ python fixTranslate.py novel.epub -q
 |--------|-------------|
 | `-o, --output` | Custom output filename |
 | `--no-translate` | Skip translation |
-| `--no-calibre` | Skip Calibre heuristic processing |
+| `--no-validate` | Skip EPUB validation/repair |
 | `--workers N` | Max concurrent translation requests (0=auto, default: 0) |
-| `--interval SECONDS` | Delay between translation requests (default: 0) |
+| `--interval SECONDS` | Delay between translation requests in seconds (default: 0) |
 | `--no-wrap-text` | Don't wrap loose text in `<p>` tags |
 | `--no-convert-br` | Don't convert `<br>` to paragraphs |
 | `--no-remove-empty` | Keep empty elements |
@@ -101,21 +101,6 @@ python fixTranslate.py novel.epub -q
 | `--no-invisible` | Keep invisible characters |
 | `--add-watermark PATTERN` | Add custom watermark regex pattern |
 | `-q, --quiet` | Suppress output except errors |
-
-## Watermark Removal
-
-The script automatically removes common Chinese novel site watermarks including:
-- 本書由...首發
-- 請到...閱讀
-- 最新章節...
-- 百度搜索...
-- 關注公眾號...
-- And many more
-
-To add custom patterns:
-```bash
-python fixTranslate.py novel.epub --add-watermark "我的自定义水印.*"
-```
 
 ## How It Works
 
@@ -130,30 +115,40 @@ Uses the same Google Translate Free API as the Calibre Ebook Translator plugin:
 
 This concurrent approach matches the Calibre plugin's `asyncio` handler, giving you the same ~40x speed improvement over sequential translation.
 
-### EPUB Processing
+### EPUB Validation
 
-1. Extracts EPUB to temp directory
-2. Processes each XHTML file:
-   - Only modifies content inside `<body>` tags
-   - Preserves all document structure, namespaces, and metadata
-3. Repackages with proper EPUB structure (mimetype first, uncompressed)
+Performs the same fixes as Calibre's heuristic processing and ADE (Adobe Digital Editions) quirks workarounds:
+- Removes `<script>`, `<embed>`, `<object>`, `<form>` elements
+- Converts `<center>` → `<div style="text-align:center">`
+- Converts `<u>` → `<span style="text-decoration:underline">`
+- Removes duplicate `id` attributes (causes EPUB validation errors)
+- Cleans zero-width spaces, soft hyphens, and other invisible characters
+- Replaces non-breaking hyphens with regular hyphens
+- Ensures `mimetype` file is first and uncompressed in the ZIP
 
-### Calibre Integration
+### Structure Fixes
 
-Automatically finds and runs `ebook-convert` with `--enable-heuristics` flag. Searches common installation paths on Windows, macOS, and Linux.
+- Body-only modification (never touches `<head>`, DOCTYPE, or namespaces)
+- Token-based parsing (safely identifies tags vs. text)
+- Tag-safe cleaning (never modifies tag attributes with watermark patterns)
+- Proper EPUB repackaging
 
-## Workflow Example
+## Typical Workflow
 
 1. Use [WebToEpub](https://github.com/dteviot/WebToEpub) browser extension to download a Chinese web novel
 2. Run: `python fixTranslate.py downloaded_novel.epub`
 3. Upload `downloaded_novel_translated.epub` to Google Play Books
 4. Read!
 
+## Adding Custom Watermarks
+
+If your source has site-specific watermarks:
+
+```bash
+python fixTranslate.py novel.epub --add-watermark "我的自定义水印.*"
+```
+
 ## Troubleshooting
-
-### "ebook-convert not found"
-
-Make sure Calibre is installed. If installed in a non-standard location, add it to your PATH.
 
 ### Translation errors / rate limiting
 
@@ -162,14 +157,20 @@ The script uses up to 100 concurrent requests by default. If you're getting erro
 - Add delay: `--interval 0.1`
 - Check your internet connection
 
-### Google Play Books "Processing failed"
+### Google Play Books still rejects the file
 
-This is why the Calibre step exists. Make sure you're not using `--no-calibre`.
+Try these steps:
+1. Make sure you're not using `--no-validate`
+2. If the issue persists, the source EPUB may have unusual issues
+
+### Output file is larger than expected
+
+The script preserves all original formatting. If size is a concern, you can use Calibre's ebook-convert to optimize images and compress further.
 
 ## Credits
 
 - **Translation API implementation** based on [Ebook Translator Calibre Plugin](https://github.com/bookfere/Ebook-Translator-Calibre-Plugin) by bookfere (GPL-3.0)
-- **Calibre** for final EPUB processing - https://calibre-ebook.com/
+- **EPUB validation logic** based on [Calibre](https://github.com/kovidgoyal/calibre) by Kovid Goyal (GPL-3.0)
 - **WebToEpub** browser extension for downloading web novels - https://github.com/dteviot/WebToEpub
 
 ### 🤖 AI-Assisted Development
