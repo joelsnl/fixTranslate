@@ -164,6 +164,7 @@ This is why the Calibre step exists. Make sure you're not using `--no-calibre`.
 
 - Translation API implementation based on [Ebook Translator Calibre Plugin](https://github.com/bookfere/Ebook-Translator-Calibre-Plugin) by bookfere
 - Uses [Calibre](https://calibre-ebook.com/) for final EPUB processing
+- Bug Fixing by Claude AI
 
 ## License
 
