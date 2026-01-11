@@ -9,15 +9,20 @@ Fixes common structural issues from WebToEpub:
 - Watermarks and ads from novel sites
 - Invisible characters
 
-Then translates Chinese to English using Google Translate (Free).
-Finally runs Calibre heuristic processing for Google Play Books compatibility.
+EPUB validation/repair (replaces Calibre heuristics):
+- Removes invalid elements (scripts, forms, embed, object)
+- Fixes deprecated tags (<center>, <u>)
+- Removes duplicate IDs
+- Cleans special characters for e-reader compatibility
+- Validates XHTML structure
+
+Translates Chinese to English using Google Translate (Free).
 
 Uses concurrent translation like the Calibre Ebook Translator plugin for speed.
 
 Usage: 
-    python epub_fixer.py input.epub                  # Full pipeline (fix + translate + calibre)
-    python epub_fixer.py input.epub --no-translate   # Fix and calibre only
-    python epub_fixer.py input.epub --no-calibre     # Fix and translate only
+    python fixTranslate.py novel.epub                  # Full pipeline (fix + translate)
+    python fixTranslate.py novel.epub --no-translate   # Fix only
 """
 
 import sys
@@ -35,6 +40,9 @@ import concurrent.futures
 import threading
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
+from html.parser import HTMLParser
+from html import unescape
+import xml.etree.ElementTree as ET
 
 
 # ============================================================================
@@ -64,11 +72,30 @@ DEFAULT_WATERMARKS = [
     r'APP下載.{0,50}',
 ]
 
+# Characters to remove (invisible/zero-width)
 INVISIBLE_CHARS = [
-    '\u200b', '\u200c', '\u200d', '\ufeff', '\u00ad', '\u2060',
-    '\u180e', '\u200e', '\u200f', '\u202a', '\u202b', '\u202c',
-    '\u202d', '\u202e',
+    '\u200b',  # Zero-width space
+    '\u200c',  # Zero-width non-joiner
+    '\u200d',  # Zero-width joiner
+    '\ufeff',  # BOM / Zero-width no-break space
+    '\u00ad',  # Soft hyphen (causes rendering issues)
+    '\u2060',  # Word joiner
+    '\u180e',  # Mongolian vowel separator
+    '\u200e',  # Left-to-right mark
+    '\u200f',  # Right-to-left mark
+    '\u202a',  # Left-to-right embedding
+    '\u202b',  # Right-to-left embedding
+    '\u202c',  # Pop directional formatting
+    '\u202d',  # Left-to-right override
+    '\u202e',  # Right-to-left override
 ]
+
+# Characters to replace (for e-reader compatibility)
+CHAR_REPLACEMENTS = {
+    '\u2011': '-',   # Non-breaking hyphen → regular hyphen
+    '\u2013': '-',   # En dash → hyphen (optional, some readers handle this)
+    '\u2014': '—',   # Em dash (keep as is, widely supported)
+}
 
 
 # ============================================================================
@@ -264,6 +291,166 @@ class GoogleFreeTranslate:
 
 
 # ============================================================================
+# EPUB VALIDATION/REPAIR - Replaces Calibre heuristics
+# ============================================================================
+class EPUBValidator:
+    """
+    EPUB validation and repair. Performs the same fixes as Calibre's
+    heuristic processing and ADE quirks workarounds.
+    """
+    
+    # Elements to remove entirely
+    REMOVE_ELEMENTS = {'script', 'embed', 'object', 'form', 'input', 'button', 'textarea'}
+    
+    # Elements to convert
+    CONVERT_ELEMENTS = {
+        'center': ('div', {'style': 'text-align:center'}),
+        'u': ('span', {'style': 'text-decoration:underline'}),
+        'font': ('span', {}),
+        's': ('span', {'style': 'text-decoration:line-through'}),
+        'strike': ('span', {'style': 'text-decoration:line-through'}),
+    }
+    
+    def __init__(self, verbose: bool = True):
+        self.verbose = verbose
+        self.stats = {
+            'elements_removed': 0,
+            'elements_converted': 0,
+            'duplicate_ids_fixed': 0,
+            'special_chars_fixed': 0,
+        }
+    
+    def log(self, message: str):
+        if self.verbose:
+            print(message)
+    
+    def clean_special_chars(self, text: str) -> str:
+        """Remove/replace special characters for e-reader compatibility."""
+        original = text
+        
+        # Remove invisible characters
+        for char in INVISIBLE_CHARS:
+            text = text.replace(char, '')
+        
+        # Replace problematic characters
+        for old, new in CHAR_REPLACEMENTS.items():
+            text = text.replace(old, new)
+        
+        if text != original:
+            self.stats['special_chars_fixed'] += 1
+        
+        return text
+    
+    def fix_xhtml(self, content: str) -> str:
+        """
+        Fix XHTML content for e-reader compatibility.
+        This replaces Calibre's heuristic processing.
+        """
+        # Track seen IDs to remove duplicates
+        seen_ids = set()
+        
+        def process_tag(match):
+            """Process a single tag, fixing issues."""
+            full_tag = match.group(0)
+            tag_name_match = re.match(r'<(/?)(\w+)', full_tag)
+            if not tag_name_match:
+                return full_tag
+            
+            is_closing = tag_name_match.group(1) == '/'
+            tag_name = tag_name_match.group(2).lower()
+            
+            # Remove forbidden elements
+            if tag_name in self.REMOVE_ELEMENTS:
+                self.stats['elements_removed'] += 1
+                return ''
+            
+            # Convert deprecated elements
+            if tag_name in self.CONVERT_ELEMENTS and not is_closing:
+                new_tag, attrs = self.CONVERT_ELEMENTS[tag_name]
+                self.stats['elements_converted'] += 1
+                
+                # Extract existing attributes
+                attr_str = full_tag[len(tag_name_match.group(0)):-1].strip()
+                if attr_str.endswith('/'):
+                    attr_str = attr_str[:-1].strip()
+                    self_closing = True
+                else:
+                    self_closing = False
+                
+                # Merge style attributes if both exist
+                existing_style = ''
+                style_match = re.search(r'style\s*=\s*["\']([^"\']*)["\']', attr_str, re.IGNORECASE)
+                if style_match:
+                    existing_style = style_match.group(1)
+                    attr_str = re.sub(r'\s*style\s*=\s*["\'][^"\']*["\']', '', attr_str, flags=re.IGNORECASE)
+                
+                # Build new tag
+                new_attrs = []
+                if attr_str.strip():
+                    new_attrs.append(attr_str.strip())
+                
+                if 'style' in attrs:
+                    combined_style = f"{existing_style}; {attrs['style']}" if existing_style else attrs['style']
+                    new_attrs.append(f'style="{combined_style}"')
+                
+                attr_part = ' '.join(new_attrs)
+                if attr_part:
+                    attr_part = ' ' + attr_part
+                
+                if self_closing:
+                    return f'<{new_tag}{attr_part}/>'
+                else:
+                    return f'<{new_tag}{attr_part}>'
+            
+            # Handle closing tags for converted elements
+            if is_closing and tag_name in self.CONVERT_ELEMENTS:
+                new_tag, _ = self.CONVERT_ELEMENTS[tag_name]
+                return f'</{new_tag}>'
+            
+            # Fix duplicate IDs
+            if not is_closing:
+                id_match = re.search(r'\sid\s*=\s*["\']([^"\']+)["\']', full_tag, re.IGNORECASE)
+                if id_match:
+                    id_val = id_match.group(1)
+                    if id_val in seen_ids:
+                        # Remove duplicate ID
+                        self.stats['duplicate_ids_fixed'] += 1
+                        full_tag = re.sub(r'\s+id\s*=\s*["\'][^"\']*["\']', '', full_tag, flags=re.IGNORECASE)
+                    else:
+                        seen_ids.add(id_val)
+            
+            return full_tag
+        
+        # Process all tags
+        tag_pattern = r'<[^>]+>'
+        content = re.sub(tag_pattern, process_tag, content)
+        
+        # Clean special characters in text (not in tags)
+        def clean_text_nodes(match):
+            tag = match.group(0)
+            return tag
+        
+        # Split by tags and clean text portions
+        parts = re.split(r'(<[^>]+>)', content)
+        cleaned_parts = []
+        for part in parts:
+            if part.startswith('<'):
+                cleaned_parts.append(part)
+            else:
+                cleaned_parts.append(self.clean_special_chars(part))
+        
+        content = ''.join(cleaned_parts)
+        
+        # Remove empty script/style tags
+        content = re.sub(r'<(script|style)[^>]*>\s*</\1>', '', content, flags=re.IGNORECASE)
+        
+        # Remove comments (optional, but can cause issues)
+        # content = re.sub(r'<!--.*?-->', '', content, flags=re.DOTALL)
+        
+        return content
+
+
+# ============================================================================
 # EPUB FIXER CLASS
 # ============================================================================
 class EPUBFixer:
@@ -277,6 +464,7 @@ class EPUBFixer:
         remove_watermarks: bool = True,
         remove_invisible_chars: bool = True,
         translate: bool = False,
+        validate_epub: bool = True,
         max_workers: int = 0,
         request_interval: float = 0.0,
         custom_watermarks: List[str] = None,
@@ -288,6 +476,7 @@ class EPUBFixer:
         self.remove_watermarks = remove_watermarks
         self.remove_invisible_chars = remove_invisible_chars
         self.translate = translate
+        self.validate_epub = validate_epub
         self.verbose = verbose
         
         # Initialize translator if needed
@@ -298,6 +487,9 @@ class EPUBFixer:
                 request_interval=request_interval,
                 verbose=verbose
             )
+        
+        # Initialize validator
+        self.validator = EPUBValidator(verbose=verbose) if validate_epub else None
         
         # Compile watermark patterns
         self.watermark_patterns = []
@@ -506,6 +698,10 @@ class EPUBFixer:
                         file_data.append(None)
                         continue
                     
+                    # Apply EPUB validation fixes to entire content first
+                    if self.validator:
+                        content = self.validator.fix_xhtml(content)
+                    
                     # Extract body
                     body_match = re.search(
                         r'(<body[^>]*>)(.*?)(</body>)', 
@@ -595,9 +791,13 @@ class EPUBFixer:
             self.log(f"\nRepackaging EPUB...")
             
             with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # CRITICAL: mimetype must be first and uncompressed
                 mimetype_path = os.path.join(temp_dir, 'mimetype')
                 if os.path.exists(mimetype_path):
                     zipf.write(mimetype_path, 'mimetype', compress_type=zipfile.ZIP_STORED)
+                else:
+                    # Create mimetype if missing
+                    zipf.writestr('mimetype', 'application/epub+zip', compress_type=zipfile.ZIP_STORED)
                 
                 for root, dirs, files in os.walk(temp_dir):
                     for filename in files:
@@ -611,6 +811,10 @@ class EPUBFixer:
         if self.translator:
             self.stats.update(self.translator.stats)
         
+        # Merge validator stats if available
+        if self.validator:
+            self.stats.update(self.validator.stats)
+        
         return self.stats
 
 
@@ -620,9 +824,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s novel.epub                     # Fix, translate, and Calibre process (default)
-  %(prog)s novel.epub --no-calibre        # Fix and translate only
-  %(prog)s novel.epub --no-translate      # Fix and Calibre process only
+  %(prog)s novel.epub                     # Fix, validate, and translate (default)
+  %(prog)s novel.epub --no-translate      # Fix and validate only
   %(prog)s novel.epub -o out.epub         # Custom output name
   %(prog)s novel.epub --workers 50        # Limit concurrent requests
   %(prog)s novel.epub --interval 0.1      # Add delay between requests
@@ -640,9 +843,9 @@ Examples:
     parser.add_argument('--interval', type=float, default=0.0,
                         help='Delay between translation requests in seconds (default: 0)')
     
-    # Calibre post-processing (on by default)
-    parser.add_argument('--no-calibre', action='store_true',
-                        help='Skip Calibre heuristic processing')
+    # EPUB validation (on by default)
+    parser.add_argument('--no-validate', action='store_true',
+                        help='Skip EPUB validation/repair')
     
     # Fix toggles
     parser.add_argument('--no-wrap-text', action='store_true',
@@ -667,9 +870,9 @@ Examples:
         print(f"Error: File not found: {args.input}")
         sys.exit(1)
     
-    # Derive flags (translate and calibre are ON by default)
+    # Derive flags (translate is ON by default)
     do_translate = not args.no_translate
-    do_calibre = not args.no_calibre
+    do_validate = not args.no_validate
     
     # Generate output filename
     output_path = args.output
@@ -687,6 +890,7 @@ Examples:
         remove_watermarks=not args.no_watermarks,
         remove_invisible_chars=not args.no_invisible,
         translate=do_translate,
+        validate_epub=do_validate,
         max_workers=args.workers,
         request_interval=args.interval,
         custom_watermarks=args.add_watermark,
@@ -694,12 +898,12 @@ Examples:
     )
     
     if not args.quiet:
-        if do_translate and do_calibre:
-            mode = "Fix, Translate & Calibre"
+        if do_translate and do_validate:
+            mode = "Fix, Validate & Translate"
         elif do_translate:
             mode = "Fix & Translate"
-        elif do_calibre:
-            mode = "Fix & Calibre"
+        elif do_validate:
+            mode = "Fix & Validate"
         else:
             mode = "Fix Only"
         print(f"EPUB Fixer ({mode})")
@@ -722,6 +926,13 @@ Examples:
         print(f"  Watermarks removed:  {stats['watermarks_removed']}")
         print(f"  Invisible chars:     {stats['invisible_removed']}")
         
+        if do_validate:
+            print(f"\nEPUB Validation:")
+            print(f"  Elements removed:    {stats.get('elements_removed', 0)}")
+            print(f"  Elements converted:  {stats.get('elements_converted', 0)}")
+            print(f"  Duplicate IDs fixed: {stats.get('duplicate_ids_fixed', 0)}")
+            print(f"  Special chars fixed: {stats.get('special_chars_fixed', 0)}")
+        
         if do_translate:
             print(f"\nTranslation:")
             print(f"  API requests:          {stats.get('requests', 0)}")
@@ -732,75 +943,6 @@ Examples:
         
         print(f"\nCompleted in {elapsed:.1f} seconds")
         print(f"✓ Saved to: {output_path}")
-    
-    # Run Calibre ebook-convert if requested
-    if do_calibre:
-        if not args.quiet:
-            print(f"\nRunning Calibre heuristic processing...")
-        
-        # Find ebook-convert
-        ebook_convert = shutil.which('ebook-convert')
-        if not ebook_convert:
-            # Try common locations
-            if sys.platform == 'win32':
-                possible_paths = [
-                    r'C:\Program Files\Calibre2\ebook-convert.exe',
-                    r'C:\Program Files (x86)\Calibre2\ebook-convert.exe',
-                    os.path.expanduser(r'~\AppData\Local\Calibre2\ebook-convert.exe'),
-                ]
-            elif sys.platform == 'darwin':
-                possible_paths = [
-                    '/Applications/calibre.app/Contents/MacOS/ebook-convert',
-                ]
-            else:
-                possible_paths = [
-                    '/usr/bin/ebook-convert',
-                    '/usr/local/bin/ebook-convert',
-                ]
-            
-            for path in possible_paths:
-                if os.path.exists(path):
-                    ebook_convert = path
-                    break
-        
-        if not ebook_convert:
-            print("Error: ebook-convert not found. Please ensure Calibre is installed.")
-            print("       You can manually run: ebook-convert output.epub output.epub --enable-heuristics")
-            sys.exit(1)
-        
-        # Create temp file for conversion
-        temp_output = output_path + '.tmp.epub'
-        
-        try:
-            cmd = [
-                ebook_convert,
-                output_path,
-                temp_output,
-                '--enable-heuristics',
-            ]
-            
-            result = subprocess.run(
-                cmd, 
-                capture_output=True, 
-                text=True
-            )
-            
-            if result.returncode == 0:
-                # Replace original with converted
-                os.replace(temp_output, output_path)
-                if not args.quiet:
-                    print(f"✓ Calibre heuristic processing complete")
-            else:
-                print(f"Calibre conversion failed: {result.stderr}")
-                if os.path.exists(temp_output):
-                    os.remove(temp_output)
-                sys.exit(1)
-                
-        except Exception as e:
-            print(f"Error running ebook-convert: {e}")
-            if os.path.exists(temp_output):
-                os.remove(temp_output)
-            sys.exit(1)
 
 
 if __name__ == "__main__":
