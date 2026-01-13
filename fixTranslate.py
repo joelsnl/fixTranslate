@@ -524,7 +524,8 @@ class EPUBProcessor:
             self.log(f"Found {total_files} content files to process")
             
             # Phase 1: Process and collect Chinese text
-            all_texts = []  # (file_idx, xpath, text)
+            # Store tuples of (element_ref, attr_name, original_text)
+            all_texts = []  # [(elem, 'text'|'tail', stripped_text), ...]
             processed_roots = []  # Store parsed trees
             file_paths = []
             
@@ -536,7 +537,7 @@ class EPUBProcessor:
                 if root is None:
                     self.log(f"  [{idx+1}/{total_files}] ✗ {filename} (parse error)")
                     processed_roots.append(None)
-                    file_paths.append(None)
+                    file_paths.append(filepath)
                     continue
                 
                 root = self.xhtml_processor.fix_structure(root)
@@ -544,49 +545,38 @@ class EPUBProcessor:
                 processed_roots.append(root)
                 file_paths.append(filepath)
                 
-                # Collect Chinese text for translation
+                # Collect Chinese text for translation - store element references directly
                 if self.translate:
                     for elem in root.iter():
                         if elem.text and self.is_chinese(elem.text):
-                            all_texts.append((idx, 'text', id(elem), elem.text.strip()))
+                            all_texts.append((elem, 'text', elem.text.strip()))
                         if elem.tail and self.is_chinese(elem.tail):
-                            all_texts.append((idx, 'tail', id(elem), elem.tail.strip()))
+                            all_texts.append((elem, 'tail', elem.tail.strip()))
                 
                 self.stats['files_processed'] += 1
             
             self.log(f"  Found {len(all_texts)} text segments to translate")
             
-            # Phase 2: Translate
+            # Phase 2: Translate and apply directly
             if self.translate and self.translator and all_texts:
                 self.log("\nTranslating...")
-                texts_to_translate = [t[3] for t in all_texts]
+                texts_to_translate = [t[2] for t in all_texts]
                 translated_texts = self.translator.translate_concurrent(texts_to_translate)
                 
-                # Build lookup for translations
-                translations = {}
-                for i, (file_idx, attr, elem_id, original) in enumerate(all_texts):
-                    translations[(file_idx, attr, elem_id)] = translated_texts[i]
-                
-                # Apply translations
-                for idx, root in enumerate(processed_roots):
-                    if root is None:
-                        continue
-                    for elem in root.iter():
-                        key_text = (idx, 'text', id(elem))
-                        key_tail = (idx, 'tail', id(elem))
-                        if key_text in translations:
-                            # Preserve leading/trailing whitespace
-                            orig = elem.text or ''
-                            leading = len(orig) - len(orig.lstrip())
-                            trailing = len(orig) - len(orig.rstrip())
-                            trans = translations[key_text]
-                            elem.text = orig[:leading] + trans + (orig[-trailing:] if trailing else '')
-                        if key_tail in translations:
-                            orig = elem.tail or ''
-                            leading = len(orig) - len(orig.lstrip())
-                            trailing = len(orig) - len(orig.rstrip())
-                            trans = translations[key_tail]
-                            elem.tail = orig[:leading] + trans + (orig[-trailing:] if trailing else '')
+                # Apply translations directly to stored element references
+                for i, (elem, attr, original) in enumerate(all_texts):
+                    translated = translated_texts[i]
+                    if attr == 'text':
+                        orig = elem.text or ''
+                        # Preserve leading/trailing whitespace
+                        leading = len(orig) - len(orig.lstrip())
+                        trailing = len(orig) - len(orig.rstrip())
+                        elem.text = orig[:leading] + translated + (orig[-trailing:] if trailing else '')
+                    else:  # tail
+                        orig = elem.tail or ''
+                        leading = len(orig) - len(orig.lstrip())
+                        trailing = len(orig) - len(orig.rstrip())
+                        elem.tail = orig[:leading] + translated + (orig[-trailing:] if trailing else '')
             
             # Phase 3: Write files
             self.log("\nWriting files...")
